@@ -18,7 +18,8 @@ fi
 WORK_DIR=${WORK_DIR:-/workspace/er/work}
 OUT_DIR=${OUT_DIR:-/workspace/er/output}
 SAMPLE=${SAMPLE:-1.0}
-echo "data=$DATA_DIR work=$WORK_DIR out=$OUT_DIR sample=$SAMPLE threads=${NUM_THREADS:-all}"
+THREADS=$(cd src && python -c "from common import N_THREADS; print(N_THREADS)")
+echo "data=$DATA_DIR work=$WORK_DIR out=$OUT_DIR sample=$SAMPLE threads=$THREADS"
 
 stage() { echo; echo "===== $1  ($(date +%H:%M:%S))"; }
 stage "1/5 prepare";  python -u src/prepare.py  --data-dir "$DATA_DIR" --work-dir "$WORK_DIR" --sample "$SAMPLE"

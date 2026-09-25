@@ -7,9 +7,30 @@ import numpy as np
 import pandas as pd
 from anyascii import anyascii
 
-# Worker threads/processes. Inside Kubernetes os.cpu_count() reports the whole host,
-# so set NUM_THREADS to the pod's real CPU limit.
-N_THREADS = int(os.environ.get("NUM_THREADS", os.cpu_count()))
+def cpu_limit():
+    """CPUs this process may really use.
+
+    Inside Kubernetes/Docker os.cpu_count() reports every core of the host, but the pod is
+    capped by a cgroup CPU quota. Starting one thread per host core then makes OpenMP code
+    (LightGBM) crawl, so we read the quota and the CPU affinity and take the smallest."""
+    n = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    for quota_file, period_file in [("/sys/fs/cgroup/cpu.max", None),
+                                    ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us")]:
+        try:
+            if period_file is None:
+                quota, period = open(quota_file).read().split()[:2]
+            else:
+                quota, period = open(quota_file).read().strip(), open(period_file).read().strip()
+            if quota not in ("max", "-1"):
+                n = min(n, max(1, int(int(quota) // int(period))))
+            break
+        except (OSError, ValueError):
+            continue
+    return max(1, n)
+
+
+# Worker threads/processes: NUM_THREADS if set, otherwise the detected CPU limit.
+N_THREADS = int(os.environ.get("NUM_THREADS") or cpu_limit())
 
 # ----------------------------------------------------------------------------- IO
 

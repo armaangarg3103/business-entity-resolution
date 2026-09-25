@@ -75,11 +75,12 @@ def main():
 
     params = dict(objective="binary", learning_rate=args.lr, num_leaves=args.leaves, min_data_in_leaf=100,
                   feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
-                  num_threads=args.threads, verbose=-1, seed=42)
+                  num_threads=args.threads, force_col_wise=True, verbose=-1, seed=42)
+    print(f"training LightGBM with {args.threads} threads (progress every 25 rounds)", flush=True)
     dA = lgb.Dataset(A[cols], A.label, free_raw_data=True)
     dB = lgb.Dataset(B[cols], B.label, reference=dA)
     model = lgb.train(params, dA, args.rounds, valid_sets=[dB], valid_names=["B"],
-                      callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)])
+                      callbacks=[lgb.early_stopping(100), lgb.log_evaluation(25)])
     model.save_model(os.path.join(w, "model.txt"))
     print(f"trained in {time.time() - t0:.0f}s, best iteration {model.best_iteration}")
 

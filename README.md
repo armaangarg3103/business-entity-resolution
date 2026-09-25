@@ -19,13 +19,13 @@ bash setup.sh
 SAMPLE=0.02 WORK_DIR=/workspace/er/work_small OUT_DIR=/workspace/er/output_small bash run_all.sh
 
 # 4. full run in the background, so closing the browser does not kill it
-NUM_THREADS=32 nohup bash run_all.sh > /workspace/er/run.log 2>&1 &
+nohup bash run_all.sh > /workspace/er/run.log 2>&1 &
 tail -f /workspace/er/run.log
 ```
 
 The dataset folder, the one holding `train/` and `test/`, is found automatically under `/workspace/er/data`.
 Set `DATA_DIR` to point elsewhere.
-Set `NUM_THREADS` to the pod's real CPU limit, because Python sees every core of the host.
+The thread count is detected from the pod's CPU limit. Set `NUM_THREADS` to override it.
 
 To get new code later, run `git pull` inside the repo folder.
 
