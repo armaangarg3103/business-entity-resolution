@@ -1,0 +1,12 @@
+# never commit data, intermediates or outputs
+data/
+dataset/
+work/
+output/
+*.tsv
+*.parquet
+*.zip
+model.txt
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
