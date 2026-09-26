@@ -136,6 +136,7 @@ def main():
     ap.add_argument("--lr", type=float, default=0.08)
     ap.add_argument("--leaves", type=int, default=255)
     ap.add_argument("--neg-rate", type=float, default=0.3, help="share of negative pairs used for training")
+    ap.add_argument("--pseudo", action="store_true", help="add <work>/pseudo.parquet (see pseudo.py) to training")
     args = ap.parse_args()
     w = args.work_dir
     path = {u: os.path.join(w, u, "features.parquet") for u in ("trainA", "trainB", "test")}
@@ -145,11 +146,19 @@ def main():
     XA, yA, wA = training_set(path["trainA"], cols, args.neg_rate, seed=1)
     XB, yB, wB = training_set(path["trainB"], cols, args.neg_rate, seed=2)
     kw = dict(leaves=args.leaves, lr=args.lr, rounds=args.rounds)
-    mA = train_gbm(XA, yA, XB, yB, wA, wB, seed=42, name="model_A", **kw)
+    tA, tB = (XA, yA, wA), (XB, yB, wB)
+    if args.pseudo:  # pseudo-labelled test rows go into training only, never into validation
+        P = pd.read_parquet(os.path.join(w, "pseudo.parquet"))
+        yP, wP = P.label.to_numpy(), np.ones(len(P), np.float32)
+        print(f"adding {len(P):,} pseudo-labelled rows ({int(yP.sum()):,} positives) to both training sets")
+        tA = (pd.concat([XA, P[cols]], ignore_index=True), np.r_[yA, yP], np.r_[wA, wP])
+        tB = (pd.concat([XB, P[cols]], ignore_index=True), np.r_[yB, yP], np.r_[wB, wP])
+        del P
+    mA = train_gbm(*tA[:2], XB, yB, tA[2], wB, seed=42, name="model_A", **kw)
     mA.save(os.path.join(w, "model_A"))
-    mB = train_gbm(XB, yB, XA, yA, wB, wA, seed=43, name="model_B", **kw)
+    mB = train_gbm(*tB[:2], XA, yA, tB[2], wA, seed=43, name="model_B", **kw)
     mB.save(os.path.join(w, "model_B"))
-    del XA, XB
+    del XA, XB, tA, tB
     print("top features:", mA.importance(cols).round(3).head(15).to_dict())
 
     summary = {"features": cols}
