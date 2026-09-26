@@ -36,6 +36,7 @@ def main():
     ap.add_argument("--override", action="append", default=[], help="COUNTRY=rule:value, repeatable")
     ap.add_argument("--stage1", action="store_true", help="use stage-1 test probabilities (p1.npy)")
     ap.add_argument("--rule", default=None, help="default rule for all countries, e.g. threshold:0.75")
+    ap.add_argument("--matching-only", action="store_true", help="skip candidate_pairs.tsv (slow; not scored)")
     args = ap.parse_args()
     w = args.work_dir
 
@@ -73,7 +74,8 @@ def main():
     out = ensure_dir(args.out_dir)
     cand = pd.DataFrame({"s1": ids[P.s1.to_numpy()], "q": ids[P.q.to_numpy()]})
     match = pd.DataFrame({"s1": ids[kept.s1.to_numpy()], "q": ids[kept.q.to_numpy()]})
-    write_id_lists(os.path.join(out, "candidate_pairs.tsv"), s1_ids, cand, "candidate_entity_ids")
+    if not args.matching_only:
+        write_id_lists(os.path.join(out, "candidate_pairs.tsv"), s1_ids, cand, "candidate_entity_ids")
     write_id_lists(os.path.join(out, "matching_results.tsv"), s1_ids, match, "matched_entity_ids")
     print(f"written to {out}")
 
