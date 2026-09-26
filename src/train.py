@@ -84,7 +84,7 @@ def main():
     model.save_model(os.path.join(w, "model.txt"))
     print(f"trained in {time.time() - t0:.0f}s, best iteration {model.best_iteration}")
 
-    prob = model.predict(B[cols], num_iteration=model.best_iteration)
+    prob = model.predict(B[cols], num_iteration=model.best_iteration, num_threads=args.threads)
     grid = [round(x, 2) for x in np.arange(0.05, 0.96, 0.05)]
     res, best_t, by_c = evaluate(w, "trainB", B, prob, grid)
     for t in grid:

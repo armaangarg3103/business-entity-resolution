@@ -6,7 +6,9 @@
 #   DATA_DIR     folder containing train/ and test/   (default: auto-detected under /workspace/er/data)
 #   WORK_DIR     intermediate files                   (default: /workspace/er/work)
 #   OUT_DIR      submission files                     (default: /workspace/er/output)
-#   NUM_THREADS  CPU threads to use                   (default: all visible cores)
+#   NUM_THREADS  CPU threads to use                   (default: the pod's CPU limit)
+#   USE_EMB      1 = add GPU multilingual embeddings  (default: 1; 0 = TF-IDF only baseline)
+#   SKIP_PREP    1 = reuse prepared records from an earlier run in WORK_DIR
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -18,15 +20,26 @@ fi
 WORK_DIR=${WORK_DIR:-/workspace/er/work}
 OUT_DIR=${OUT_DIR:-/workspace/er/output}
 SAMPLE=${SAMPLE:-1.0}
+USE_EMB=${USE_EMB:-1}
 THREADS=$(cd src && python -c "from common import N_THREADS; print(N_THREADS)")
 echo "data=$DATA_DIR work=$WORK_DIR out=$OUT_DIR sample=$SAMPLE threads=$THREADS"
 
 stage() { echo; echo "===== $1  ($(date +%H:%M:%S))"; }
-stage "1/5 prepare";  python -u src/prepare.py  --data-dir "$DATA_DIR" --work-dir "$WORK_DIR" --sample "$SAMPLE"
-stage "2/5 block";    python -u src/block.py    --work-dir "$WORK_DIR"
-stage "3/5 features"; python -u src/features.py --work-dir "$WORK_DIR"
-stage "4/5 train";    python -u src/train.py    --work-dir "$WORK_DIR"
-stage "5/5 predict";  python -u src/predict.py  --work-dir "$WORK_DIR" --out-dir "$OUT_DIR"
+if [ "${SKIP_PREP:-0}" = "1" ]; then
+  echo "reusing prepared records in $WORK_DIR"
+else
+  stage "1/6 prepare"; python -u src/prepare.py --data-dir "$DATA_DIR" --work-dir "$WORK_DIR" --sample "$SAMPLE"
+fi
+if [ "$USE_EMB" = "1" ]; then
+  stage "2/6 embed (GPU)"; python -u src/embed.py --work-dir "$WORK_DIR"
+  EMB_K=5
+else
+  echo "skipping embeddings (USE_EMB=0)"; EMB_K=0
+fi
+stage "3/6 block";    python -u src/block.py    --work-dir "$WORK_DIR" --emb-k "$EMB_K"
+stage "4/6 features"; python -u src/features.py --work-dir "$WORK_DIR"
+stage "5/6 train";    python -u src/train.py    --work-dir "$WORK_DIR"
+stage "6/6 predict";  python -u src/predict.py  --work-dir "$WORK_DIR" --out-dir "$OUT_DIR"
 
 VALIDATOR="$DATA_DIR/../utils/validate_submission.py"
 if [ -f "$VALIDATOR" ] && [ "$SAMPLE" = "1.0" ]; then

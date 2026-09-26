@@ -36,7 +36,11 @@ def record_tokens(core, alt, sq, addr, nums):
     return toks
 
 
-def block_country(g, top_k, max_df, threads):
+def block_country(g, top_k, max_df, threads, emb=None, emb_k=5):
+    """Top-K S1 candidates per S2/S3 record for one country.
+
+    TF-IDF top-K always; if embeddings are given, the embedding top-emb_k is added (union).
+    Every kept pair gets both scores and both ranks, so the model sees each view."""
     docs = [record_tokens(*r) for r in zip(g.name_core, g.name_alt, g.name_sq, g.addr_n, g.nums)]
     vec = TfidfVectorizer(analyzer=lambda x: x, sublinear_tf=True, max_df=max_df, min_df=1, dtype=np.float32)
     X = vec.fit_transform(docs)
@@ -44,24 +48,88 @@ def block_country(g, top_k, max_df, threads):
     s1_rows, q_rows = np.flatnonzero(is_s1), np.flatnonzero(~is_s1)
     if len(s1_rows) == 0 or len(q_rows) == 0:
         return None
-    S = X[s1_rows].T.tocsr()
-    Q = X[q_rows]
-    C = sp_matmul_topn(Q, S, top_n=top_k, threshold=1e-6, sort=True, n_threads=threads).tocoo()
+    C = sp_matmul_topn(X[q_rows], X[s1_rows].T.tocsr(), top_n=top_k, threshold=1e-6, sort=True,
+                       n_threads=threads).tocoo()
+    lq, ls = q_rows[C.row], s1_rows[C.col]          # positions inside g
+    out = {"lq": lq, "ls": ls}
+    if emb is not None:
+        gi = g.index.to_numpy()
+        eq, es = embedding_topk(emb, gi[q_rows], gi[s1_rows], emb_k)
+        pairs = pd.DataFrame({"lq": np.r_[lq, q_rows[eq]], "ls": np.r_[ls, s1_rows[es]]}).drop_duplicates()
+        lq, ls = pairs.lq.to_numpy(), pairs.ls.to_numpy()
+        out = {"lq": lq, "ls": ls, "emb": combined_cosine(emb, gi[lq], gi[ls])}
+    out["tfidf"] = rowwise_dot(X, lq, ls)
+    out = pd.DataFrame(out)
     gi = g.index.to_numpy()
-    out = pd.DataFrame({"q": gi[q_rows[C.row]], "s1": gi[s1_rows[C.col]], "tfidf": C.data.astype(np.float32)})
-    out = out.sort_values(["q", "tfidf"], ascending=[True, False], kind="stable")
+    out["q"], out["s1"] = gi[out.lq], gi[out.ls]
+    out = out.drop(columns=["lq", "ls"]).sort_values(["q", "tfidf"], ascending=[True, False], kind="stable")
     out["rank"] = out.groupby("q").cumcount().astype(np.int16) + 1
+    if emb is not None:
+        out["emb_rank"] = out.groupby("q")["emb"].rank(ascending=False, method="first").astype(np.int16)
     return out
 
 
-def run(work, universe, top_k, max_df, threads):
+def rowwise_dot(X, a, b, chunk=2_000_000):
+    """Cosine of TF-IDF rows a[i] and b[i] (rows are already L2-normalised)."""
+    res = np.empty(len(a), np.float32)
+    for i in range(0, len(a), chunk):
+        res[i:i + chunk] = np.asarray(X[a[i:i + chunk]].multiply(X[b[i:i + chunk]]).sum(axis=1)).ravel()
+    return res
+
+
+def _comb(emb, rows, torch, dev, dtype):
+    """Normalised (name + address) embedding for the given universe rows, as a GPU tensor."""
+    n = torch.from_numpy(np.asarray(emb[0][rows], dtype=np.float32)).to(dev)
+    n += torch.from_numpy(np.asarray(emb[1][rows], dtype=np.float32)).to(dev)
+    return torch.nn.functional.normalize(n, dim=1).to(dtype)
+
+
+def embedding_topk(emb, q_idx, s_idx, k, chunk=4096):
+    """For each query row, the k most similar S1 rows by combined embedding (GPU matmul + topk).
+
+    Returns (query position, S1 position) arrays, positions relative to q_idx / s_idx."""
+    import torch
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if dev == "cuda" else torch.float32
+    S = torch.cat([_comb(emb, s_idx[i:i + 500_000], torch, dev, dtype) for i in range(0, len(s_idx), 500_000)])
+    k = min(k, len(s_idx))
+    qi, si = [], []
+    for i in range(0, len(q_idx), chunk):
+        Q = _comb(emb, q_idx[i:i + chunk], torch, dev, dtype)
+        top = (Q @ S.T).topk(k, dim=1).indices.cpu().numpy()
+        qi.append(np.repeat(np.arange(i, i + len(top)), k))
+        si.append(top.ravel())
+    del S
+    return np.concatenate(qi), np.concatenate(si)
+
+
+def combined_cosine(emb, a, b, chunk=250_000):
+    res = np.empty(len(a), np.float32)
+    for i in range(0, len(a), chunk):
+        x = emb[0][a[i:i + chunk]].astype(np.float32) + emb[1][a[i:i + chunk]].astype(np.float32)
+        y = emb[0][b[i:i + chunk]].astype(np.float32) + emb[1][b[i:i + chunk]].astype(np.float32)
+        res[i:i + chunk] = (x * y).sum(1) / (np.linalg.norm(x, axis=1) * np.linalg.norm(y, axis=1) + 1e-6)
+    return res
+
+
+def load_embeddings(d):
+    """(name, address) float16 arrays, memory-mapped from disk; None if the embed stage has not run."""
+    paths = [os.path.join(d, "emb_name.npy"), os.path.join(d, "emb_addr.npy")]
+    if not all(os.path.exists(p) for p in paths):
+        return None
+    return tuple(np.load(p, mmap_mode="r") for p in paths)
+
+
+def run(work, universe, top_k, max_df, threads, emb_k):
     d = os.path.join(work, universe)
     recs = pd.read_parquet(d + "/records.parquet",
                            columns=["entity_id", "src", "country", "name_core", "name_alt", "name_sq", "addr_n", "nums"])
+    emb = load_embeddings(d) if emb_k > 0 else None
+    print(f"[{universe}] embeddings: {'yes, top-%d added' % emb_k if emb is not None else 'not used'}")
     parts = []
     for country, g in recs.groupby("country"):
         t0 = time.time()
-        p = block_country(g, top_k, max_df, threads)
+        p = block_country(g, top_k, max_df, threads, emb, emb_k)
         if p is not None:
             parts.append(p)
             print(f"[{universe}] {country}: {len(g):,} records -> {len(p):,} pairs in {time.time() - t0:.0f}s")
@@ -88,9 +156,10 @@ def main():
     ap.add_argument("--top-k", type=int, default=8)
     ap.add_argument("--max-df", type=float, default=0.01)
     ap.add_argument("--threads", type=int, default=N_THREADS)
+    ap.add_argument("--emb-k", type=int, default=5, help="embedding candidates per record (0 = TF-IDF only)")
     args = ap.parse_args()
     for u in args.universes.split(","):
-        run(args.work_dir, u, args.top_k, args.max_df, args.threads)
+        run(args.work_dir, u, args.top_k, args.max_df, args.threads, args.emb_k)
 
 
 if __name__ == "__main__":

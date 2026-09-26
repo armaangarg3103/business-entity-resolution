@@ -191,7 +191,7 @@ def macro_f05_vec(s1_all, truth_pairs, pred_pairs):
 
 def write_id_lists(path, s1_ids, pairs, col_name):
     """Write one row per S1 id with a comma-joined, de-duplicated list (possibly empty)."""
-    lists = pairs.groupby("s1")["q"].apply(lambda x: ",".join(dict.fromkeys(x)))
+    lists = pairs.drop_duplicates(["s1", "q"]).groupby("s1", sort=False)["q"].agg(",".join)
     out = pd.DataFrame({"source1_entity_id": s1_ids})
     out[col_name] = out.source1_entity_id.map(lists).fillna("")
     out.to_csv(path, sep="\t", index=False)

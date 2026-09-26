@@ -43,7 +43,8 @@ PAIR_SCORES = [
     ("nums_tset", "nums", fuzz.token_set_ratio),
     ("nums_ratio", "nums", fuzz.ratio),
 ]
-GROUP_REL = ["name_tset", "core_tset", "sq_partial", "addr_tset", "nums_tset", "tfidf"]
+GROUP_REL = ["name_tset", "core_tset", "sq_partial", "addr_tset", "nums_tset", "tfidf",
+             "emb", "emb_name", "emb_addr"]  # emb* only when the embed stage has run
 
 
 def score(a, b, scorer):
@@ -66,6 +67,14 @@ def margin_over_others(q, v):
     others = np.where(first, m2[grp], m1[grp])
     out = np.empty_like(v)
     out[order] = vs - others
+    return out
+
+
+def rowwise_cosine(E, a, b, chunk=500_000):
+    """Dot product of L2-normalised embedding rows a[i], b[i]."""
+    out = np.empty(len(a), np.float32)
+    for i in range(0, len(a), chunk):
+        out[i:i + chunk] = (E[a[i:i + chunk]].astype(np.float32) * E[b[i:i + chunk]].astype(np.float32)).sum(1)
     return out
 
 
@@ -99,6 +108,13 @@ def run(work, universe, chunk):
     for k in feats:
         pairs[k] = np.concatenate(feats[k])
 
+    # multilingual embedding cosines (name vs name, address vs address)
+    for col, fname in [("emb_name", "emb_name.npy"), ("emb_addr", "emb_addr.npy")]:
+        path = os.path.join(d, fname)
+        if os.path.exists(path):
+            pairs[col] = rowwise_cosine(np.load(path, mmap_mode="r"), q, s)
+            print(f"[{universe}] {col} cosine added", flush=True)
+
     # lengths and flags
     for side, idx in [("q", q), ("s1", s)]:
         pairs[f"{side}_name_len"] = df.name_n.str.len().to_numpy()[idx].astype(np.int16)
@@ -111,7 +127,8 @@ def run(work, universe, chunk):
     # competition among the candidates of the same S2/S3 record
     pairs["n_cand"] = pairs.groupby("q")["s1"].transform("size").astype(np.int16)
     for c in GROUP_REL:
-        pairs[f"{c}_margin"] = margin_over_others(q, pairs[c].to_numpy())
+        if c in pairs:
+            pairs[f"{c}_margin"] = margin_over_others(q, pairs[c].to_numpy())
     # popularity of the S1 side: how many S2/S3 records point at it (at all / at rank 1)
     gs = pairs.assign(top1=(pairs["rank"] == 1).astype(np.int32)).groupby("s1")
     pairs["s1_n_q"] = gs["q"].transform("size").astype(np.int32)

@@ -11,7 +11,7 @@ import os
 import lightgbm as lgb
 import pandas as pd
 
-from common import ensure_dir, write_id_lists
+from common import N_THREADS, ensure_dir, write_id_lists
 from train import decide
 
 
@@ -31,7 +31,7 @@ def main():
     ids = recs.entity_id.to_numpy()
     s1_ids = ids[recs.src.to_numpy() == 1]
     feats = pd.read_parquet(os.path.join(w, "test", "features.parquet"))
-    prob = model.predict(feats[cfg["features"]], num_iteration=cfg["best_iteration"])
+    prob = model.predict(feats[cfg["features"]], num_iteration=cfg["best_iteration"], num_threads=N_THREADS)
 
     kept = decide(feats, prob, thr)
     out = ensure_dir(args.out_dir)
