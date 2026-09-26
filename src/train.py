@@ -5,25 +5,86 @@
   second stage (refine.py) learns from honest, never-seen-in-training probabilities.
   The test probability is the average of both models, so all training data is used.
 
-Output: <work>/model_A.txt, model_B.txt, stage1.json and <work>/<universe>/p1.npy
+Memory: a half has ~60M candidate pairs. Training keeps every positive and a random share of
+negatives (--neg-rate), weighted by 1/rate so probabilities stay calibrated; prediction streams
+the parquet files in batches. Peak RAM is a few GB instead of tens.
+
+Output: <work>/model_A.*, model_B.*, stage1.json and <work>/<universe>/p1.npy
 """
 import argparse
 import json
 import os
-import time
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from common import macro_f05_vec
 from gbm import train_gbm
 
 NOT_FEATURES = {"q", "s1", "label"}
+BATCH = int(os.environ.get("FEATURE_BATCH", 4_000_000))   # rows per streamed batch
 
 
-def feature_cols(df):
-    return [c for c in df.columns if c not in NOT_FEATURES]
+# ----------------------------------------------------------------------------- streaming helpers
 
+def feature_names(path):
+    return [c for c in pq.ParquetFile(path).schema_arrow.names if c not in NOT_FEATURES]
+
+
+def read_cols(path, cols):
+    return pq.read_table(path, columns=cols).to_pandas()
+
+
+def iter_batches(path, cols):
+    for b in pq.ParquetFile(path).iter_batches(batch_size=BATCH, columns=cols):
+        yield b.to_pandas()
+
+
+def sample_mask(labels, rate, seed):
+    """All positives plus a random `rate` share of negatives."""
+    return (labels == 1) | (np.random.default_rng(seed).random(len(labels)) < rate)
+
+
+def load_rows(path, cols, mask, extra=None):
+    """Rows of the parquet where mask is True (optionally joined with row-aligned extra columns)."""
+    parts, off = [], 0
+    for b in iter_batches(path, cols):
+        n = len(b)
+        m = mask[off:off + n]
+        part = b[m].reset_index(drop=True)
+        if extra is not None:
+            part = pd.concat([part, extra.iloc[off:off + n][m].reset_index(drop=True)], axis=1)
+        parts.append(part)
+        off += n
+    return pd.concat(parts, ignore_index=True)
+
+
+def predict_stream(models, path, cols, extra=None, use_cols=None):
+    """Average prediction of `models` over all rows of the parquet, batch by batch."""
+    out, off = [], 0
+    for b in iter_batches(path, cols):
+        n = len(b)
+        if extra is not None:
+            b = pd.concat([b.reset_index(drop=True), extra.iloc[off:off + n].reset_index(drop=True)], axis=1)
+        X = b[use_cols] if use_cols else b
+        out.append(np.mean([m.predict(X) for m in models], axis=0).astype(np.float32))
+        off += n
+    return np.concatenate(out)
+
+
+def training_set(path, cols, rate, seed, extra=None):
+    y = read_cols(path, ["label"]).label.to_numpy()
+    mask = sample_mask(y, rate, seed)
+    X = load_rows(path, cols, mask, extra)
+    y = y[mask]
+    w = np.where(y == 1, 1.0, 1.0 / rate).astype(np.float32)
+    print(f"   {os.path.basename(os.path.dirname(path))}: {mask.sum():,} of {len(mask):,} rows "
+          f"({(y == 1).sum():,} positives)", flush=True)
+    return X, y, w
+
+
+# ----------------------------------------------------------------------------- decision + metric
 
 def decide(pairs, prob, threshold):
     """Threshold rule: best S1 per q, kept if its probability >= threshold."""
@@ -59,17 +120,13 @@ def score_by_country(ev, kept):
 
 
 def threshold_sweep(ev, pairs, prob, grid=None):
-    grid = grid or [round(x, 2) for x in np.arange(0.05, 0.96, 0.05)]
+    grid = grid or [round(float(x), 2) for x in np.arange(0.05, 0.96, 0.05)]
     res = {t: score_kept(ev, decide(pairs, prob, t)) for t in grid}
     best = max(res, key=res.get)
     return best, res
 
 
-def fit(train, valid, cols, args, name):
-    print(f"[{name}] training on {len(train):,} rows (progress every 50 rounds)", flush=True)
-    return train_gbm(train[cols], train.label, valid[cols], valid.label,
-                     leaves=args.leaves, lr=args.lr, rounds=args.rounds, seed=42, name=name)
-
+# ----------------------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser()
@@ -77,33 +134,36 @@ def main():
     ap.add_argument("--rounds", type=int, default=3000)
     ap.add_argument("--lr", type=float, default=0.08)
     ap.add_argument("--leaves", type=int, default=255)
+    ap.add_argument("--neg-rate", type=float, default=0.3, help="share of negative pairs used for training")
     args = ap.parse_args()
     w = args.work_dir
+    path = {u: os.path.join(w, u, "features.parquet") for u in ("trainA", "trainB", "test")}
+    cols = feature_names(path["trainA"])
+    print(f"{len(cols)} features; sampling negatives at {args.neg_rate}")
 
-    A = pd.read_parquet(os.path.join(w, "trainA", "features.parquet"))
-    B = pd.read_parquet(os.path.join(w, "trainB", "features.parquet"))
-    cols = feature_cols(A)
-    print(f"A rows {len(A):,} | B rows {len(B):,} | {len(cols)} features")
-
-    mA = fit(A, B, cols, args, "model_A")
+    XA, yA, wA = training_set(path["trainA"], cols, args.neg_rate, seed=1)
+    XB, yB, wB = training_set(path["trainB"], cols, args.neg_rate, seed=2)
+    kw = dict(leaves=args.leaves, lr=args.lr, rounds=args.rounds)
+    mA = train_gbm(XA, yA, XB, yB, wA, wB, seed=42, name="model_A", **kw)
     mA.save(os.path.join(w, "model_A"))
-    mB = fit(B, A, cols, args, "model_B")
+    mB = train_gbm(XB, yB, XA, yA, wB, wA, seed=43, name="model_B", **kw)
     mB.save(os.path.join(w, "model_B"))
+    del XA, XB
+    print("top features:", mA.importance(cols).round(3).head(15).to_dict())
 
     summary = {"features": cols}
-    for u, df, m in [("trainA", A, mB), ("trainB", B, mA)]:
-        p = m.predict(df[cols])
+    for u, m in [("trainA", mB), ("trainB", mA)]:
+        p = predict_stream([m], path[u], cols)
         np.save(os.path.join(w, u, "p1.npy"), p)
+        K = read_cols(path[u], ["q", "s1"])
         ev = load_eval(w, u)
-        t, res = threshold_sweep(ev, df, p)
-        summary[u] = {"threshold": t, "f05": res[t], "by_country": score_by_country(ev, decide(df, p, t))}
-        print(f"[stage 1] {u} out-of-fold: best threshold {t} -> macro F0.5 {res[t]:.4f} {summary[u]['by_country']}")
-    print("top features:", mA.importance(cols).round(3).head(15).to_dict())
-    del A, B
+        t, res = threshold_sweep(ev, K, p)
+        summary[u] = {"threshold": t, "f05": res[t], "by_country": score_by_country(ev, decide(K, p, t))}
+        print(f"[stage 1] {u} out-of-fold: best threshold {t} -> macro F0.5 {res[t]:.4f} {summary[u]['by_country']}",
+              flush=True)
 
-    T = pd.read_parquet(os.path.join(w, "test", "features.parquet"), columns=cols)
-    p = 0.5 * (mA.predict(T) + mB.predict(T))
-    np.save(os.path.join(w, "test", "p1.npy"), p.astype(np.float32))
+    p = predict_stream([mA, mB], path["test"], cols)
+    np.save(os.path.join(w, "test", "p1.npy"), p)
     print(f"[stage 1] test probabilities written ({len(p):,} pairs)")
     with open(os.path.join(w, "stage1.json"), "w") as f:
         json.dump(summary, f, indent=2)

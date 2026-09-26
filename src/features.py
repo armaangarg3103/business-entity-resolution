@@ -141,7 +141,7 @@ def run(work, universe, chunk):
         key = pd.Series(1, index=pd.MultiIndex.from_arrays([t.q, t.s1]))
         pairs["label"] = key.reindex(pd.MultiIndex.from_arrays([ids[q], ids[s]])).fillna(0).to_numpy(np.int8)
         print(f"[{universe}] positives {pairs.label.mean():.3f}")
-    pairs.to_parquet(d + "/features.parquet", index=False)
+    pairs.to_parquet(d + "/features.parquet", index=False, row_group_size=1_000_000)  # small blocks for streaming
     print(f"[{universe}] {pairs.shape} features written in {time.time() - t0:.0f}s")
 
 

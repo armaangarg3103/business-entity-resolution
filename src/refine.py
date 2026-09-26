@@ -6,14 +6,17 @@ Stage 1 scores each pair in isolation. Here every pair also sees its neighbourho
             the expected cluster size (sum of probabilities)
   coherence how similar the record is to the entity's strongest OTHER candidate (anchor):
             true members of one business agree with each other, look-alikes do not
-The stage-2 LightGBM is trained on half A (out-of-fold stage-1 probabilities) and tuned on B.
+The stage-2 model is trained on half A (out-of-fold stage-1 probabilities) and tuned on B.
+Like stage 1 it trains on all positives plus a weighted share of negatives and predicts in
+streamed batches, so memory stays bounded on ~100M-pair universes.
 
 Two decision rules are compared on B and the better one is used for test:
   threshold  each record goes to its best S1 if p >= t
   expected   each record goes to its best S1; then per S1 entity the top-k set that maximises
              the expected F0.5 (including k = 0, i.e. predicting a singleton) is kept
 
-Output: <out>/matching_results.tsv, <out>/candidate_pairs.tsv, <work>/stage2.json
+Output: <out>/matching_results.tsv, <out>/candidate_pairs.tsv, <work>/stage2.json,
+        <work>/test/p2.parquet (for variant.py)
 """
 import argparse
 import json
@@ -26,9 +29,12 @@ from rapidfuzz import fuzz
 from rapidfuzz.process import cpdist
 
 from common import N_THREADS, ensure_dir, write_id_lists
-from gbm import train_gbm
 from features import margin_over_others
-from train import decide, load_eval, score_by_country, score_kept, threshold_sweep
+from gbm import train_gbm
+from train import (decide, load_eval, predict_stream, read_cols, score_by_country, score_kept,
+                   threshold_sweep, training_set)
+
+F32 = np.float32
 
 
 def top2_rows(group, value):
@@ -47,43 +53,45 @@ def top2_rows(group, value):
     return b, s
 
 
-def graph_features(work, universe, F, p):
-    """Neighbourhood features from stage-1 probabilities p (aligned with rows of F)."""
-    q, s1 = F.q.to_numpy(), F.s1.to_numpy()
-    G = pd.DataFrame({"q": q, "s1": s1, "p1": p})
+def graph_features(work, universe, K, p):
+    """Neighbourhood features from stage-1 probabilities p (row-aligned with K: q, s1, q_src)."""
+    q, s1, src = K.q.to_numpy(), K.s1.to_numpy(), K.q_src.to_numpy()
+    G = pd.DataFrame({"p1": p.astype(F32)})
     G["p1_q_margin"] = margin_over_others(q, p)
-    G["p1_q_sum"] = G.groupby("q").p1.transform("sum")
-    G["p1_q_rank"] = G.groupby("q").p1.rank(ascending=False, method="first").astype(np.float32)
-    is_best = G.p1_q_margin >= 0
-    G["own"] = np.where(is_best, p, 0).astype(np.float32)
-    gs = G.groupby("s1")
-    G["s1_psum"] = gs.p1.transform("sum")
-    G["s1_own_sum"] = gs.own.transform("sum")
-    G["s1_pmax"] = gs.p1.transform("max")
-    G["s1_n_hi"] = G.assign(h=(G.p1 > 0.5).astype(np.int32)).groupby("s1").h.transform("sum")
-    G["s1_prank"] = gs.p1.rank(ascending=False, method="first").astype(np.float32)
-    G["p1_rel_s1max"] = (G.p1 / G.s1_pmax.clip(lower=1e-6)).astype(np.float32)
-    src = F.q_src.to_numpy()
+    tmp = pd.DataFrame({"q": q, "s1": s1, "p": p})
+    G["p1_q_sum"] = tmp.groupby("q").p.transform("sum").astype(F32).to_numpy()
+    G["p1_q_rank"] = tmp.groupby("q").p.rank(ascending=False, method="first").astype(F32).to_numpy()
+    tmp["own"] = np.where(G.p1_q_margin.to_numpy() >= 0, p, 0).astype(F32)
+    tmp["hi"] = (p > 0.5).astype(np.int32)
     for sv in (2, 3):
-        G[f"s1_own_src{sv}"] = G.assign(o=np.where(src == sv, G.own, 0)).groupby("s1").o.transform("sum")
+        tmp[f"own{sv}"] = np.where(src == sv, tmp.own, 0).astype(F32)
+    gs = tmp.groupby("s1")
+    G["s1_psum"] = gs.p.transform("sum").astype(F32).to_numpy()
+    G["s1_own_sum"] = gs.own.transform("sum").astype(F32).to_numpy()
+    G["s1_pmax"] = gs.p.transform("max").astype(F32).to_numpy()
+    G["s1_n_hi"] = gs.hi.transform("sum").astype(F32).to_numpy()
+    G["s1_prank"] = gs.p.rank(ascending=False, method="first").astype(F32).to_numpy()
+    for sv in (2, 3):
+        G[f"s1_own_src{sv}"] = gs[f"own{sv}"].transform("sum").astype(F32).to_numpy()
+    G["p1_rel_s1max"] = (p / np.maximum(G.s1_pmax.to_numpy(), 1e-6)).astype(F32)
+    del tmp, gs
 
     # coherence with the entity's strongest other candidate
     best, second = top2_rows(s1, p)
     rows = np.arange(len(G))
     anchor = np.where(best == rows, second, best)
-    has = anchor >= 0
+    has = np.flatnonzero(anchor >= 0)
     recs = pd.read_parquet(os.path.join(work, universe, "records.parquet"), columns=["name_n", "addr_n"])
-    name = recs.name_n.to_numpy(dtype=object)
-    addr = recs.addr_n.to_numpy(dtype=object)
-    qa = q[anchor[has]]
-    qq = q[has]
-    for col, arr in [("anchor_name_tset", name), ("anchor_addr_tset", addr)]:
-        v = np.full(len(G), np.nan, np.float32)
-        v[has] = cpdist(arr[qq].tolist(), arr[qa].tolist(), scorer=fuzz.token_set_ratio,
-                        workers=N_THREADS, dtype=np.float32)
+    for col, arr in [("anchor_name_tset", recs.name_n.to_numpy(dtype=object)),
+                     ("anchor_addr_tset", recs.addr_n.to_numpy(dtype=object))]:
+        v = np.full(len(G), np.nan, F32)
+        for i in range(0, len(has), 10_000_000):
+            h = has[i:i + 10_000_000]
+            v[h] = cpdist(arr[q[h]].tolist(), arr[q[anchor[h]]].tolist(), scorer=fuzz.token_set_ratio,
+                          workers=N_THREADS, dtype=F32)
         G[col] = v
-    G["anchor_p1"] = np.where(has, p[np.maximum(anchor, 0)], np.nan).astype(np.float32)
-    return G.drop(columns=["q", "s1", "own"])
+    G["anchor_p1"] = np.where(anchor >= 0, p[np.maximum(anchor, 0)], np.nan).astype(F32)
+    return G
 
 
 def expected_f_decide(pairs, prob, alpha=1.0):
@@ -131,27 +139,32 @@ def main():
     ap.add_argument("--rounds", type=int, default=2000)
     ap.add_argument("--lr", type=float, default=0.05)
     ap.add_argument("--leaves", type=int, default=127)
+    ap.add_argument("--neg-rate", type=float, default=0.3)
     args = ap.parse_args()
     w = args.work_dir
     cols1 = json.load(open(os.path.join(w, "stage1.json")))["features"]
+    path = {u: os.path.join(w, u, "features.parquet") for u in ("trainA", "trainB", "test")}
 
-    def build(u):
+    def graph(u):
         t0 = time.time()
-        F = pd.read_parquet(os.path.join(w, u, "features.parquet"))
+        K = read_cols(path[u], ["q", "s1", "q_src"])
         p = np.load(os.path.join(w, u, "p1.npy"))
-        G = graph_features(w, u, F, p)
-        X = pd.concat([F[cols1].reset_index(drop=True), G.reset_index(drop=True)], axis=1)
-        print(f"[{u}] stage-2 features {X.shape} in {time.time() - t0:.0f}s", flush=True)
-        return F[["q", "s1"] + (["label"] if "label" in F else [])], X, p
+        G = graph_features(w, u, K, p)
+        print(f"[{u}] {G.shape[1]} group features for {len(G):,} pairs in {time.time() - t0:.0f}s", flush=True)
+        return K, G, p
 
-    KA, XA, _ = build("trainA")
-    KB, XB, pB1 = build("trainB")
+    _, GA, _ = graph("trainA")
+    XA, yA, wA = training_set(path["trainA"], cols1, args.neg_rate, seed=11, extra=GA)
+    del GA
+    KB, GB, pB1 = graph("trainB")
+    XB, yB, wB = training_set(path["trainB"], cols1, args.neg_rate, seed=12, extra=GB)
     cols2 = list(XA.columns)
-    m = train_gbm(XA, KA.label, XB, KB.label, leaves=args.leaves, lr=args.lr, rounds=args.rounds, seed=7,
+    m = train_gbm(XA, yA, XB, yB, wA, wB, leaves=args.leaves, lr=args.lr, rounds=args.rounds, seed=7,
                   name="stage2")
     m.save(os.path.join(w, "model_stage2"))
-    pB = m.predict(XB)
-    del XA
+    del XA, XB
+    pB = predict_stream([m], path["trainB"], cols1, extra=GB, use_cols=cols2)
+    del GB
 
     ev = load_eval(w, "trainB")
     t1, r1 = threshold_sweep(ev, KB, pB1)
@@ -170,11 +183,13 @@ def main():
     print(f"[B] chosen rule {rule}: macro F0.5 {cands[rule]:.4f} by country {score_by_country(ev, keptB)}")
     error_report(ev, keptB)
     print("stage-2 top features:", m.importance(cols2).round(3).head(12).to_dict())
-    del XB
+    del KB, keptB
 
-    KT, XT, _ = build("test")
-    pT = m.predict(XT[cols2])
-    pd.DataFrame({"q": KT.q.to_numpy(), "s1": KT.s1.to_numpy(), "p": pT.astype(np.float32)})         .to_parquet(os.path.join(w, "test", "p2.parquet"), index=False)   # for variant.py
+    KT, GT, _ = graph("test")
+    pT = predict_stream([m], path["test"], cols1, extra=GT, use_cols=cols2)
+    del GT
+    pd.DataFrame({"q": KT.q.to_numpy(), "s1": KT.s1.to_numpy(), "p": pT}) \
+        .to_parquet(os.path.join(w, "test", "p2.parquet"), index=False)   # for variant.py
     kept = apply(KT, pT)
     recs = pd.read_parquet(os.path.join(w, "test", "records.parquet"), columns=["entity_id", "src", "country"])
     ids = recs.entity_id.to_numpy()
@@ -191,7 +206,7 @@ def main():
     print(f"[test] rule {rule} | {len(s1_ids):,} S1 entities | {len(match):,} matches")
     print(stats.groupby("country").n.agg(avg_matches="mean", empty_share=lambda x: (x == 0).mean()).round(3))
     with open(os.path.join(w, "stage2.json"), "w") as f:
-        json.dump({"rule": list(rule), "valid_f05": cands[rule], "best_iteration": m.best_iteration,
+        json.dump({"rule": [rule[0], float(rule[1])], "valid_f05": cands[rule], "best_iteration": m.best_iteration,
                    "features": cols2}, f, indent=2)
 
 
