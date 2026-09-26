@@ -35,8 +35,8 @@ To get new code later, run `git pull` inside the repo folder.
 |---|---|
 | `output/matching_results.tsv` | final matches; this is what you upload to the leaderboard |
 | `output/candidate_pairs.tsv` | every pair the model scored, a superset of the matches |
-| `work/decision.json` | tuned threshold and validation F0.5, overall and per country |
-| `work/model.txt` | trained LightGBM model |
+| `work/stage1.json`, `work/stage2.json` | validation F0.5 per stage and country, chosen decision rule |
+| `work/model_A.txt`, `model_B.txt`, `model_stage2.txt` | trained models |
 
 After a full run, `run_all.sh` runs the official validator automatically.
 
@@ -47,8 +47,9 @@ After a full run, `run_all.sh` runs the official validator automatically.
 | 1 | `src/prepare.py` | Splits train by S1 entity into two halves, A and B, each about the size of the test set. Normalizes text: ascii-folds any script, lowercases, canonicalizes abbreviations, extracts address numbers, and splits DBA / "formerly" aliases. Generic name words such as inc, pvt or sarl are **discovered per country from word frequency**, not hand-listed, so France works without French training data. |
 | 2 | `src/block.py` | Each S2/S3 record keeps its top-K most similar S1 records of the same country. The search uses sparse TF-IDF over name words, name character trigrams, address words and numbers. Reports blocking recall on the train halves. |
 | 3 | `src/features.py` | About 40 country-independent features: fuzzy name and address scores, number overlap, the blocking score and rank, and the **margin over the best competing candidate** of the same record. |
-| 4 | `src/train.py` | Trains LightGBM on half A with early stopping on half B. Picks the probability threshold that maximizes macro F0.5 on B. |
-| 5 | `src/predict.py` | Scores the test pairs. Each S2/S3 record is linked only to its single best S1, and only above the threshold, because ground truth never links one record to two entities. Writes both TSVs. |
+| 2b | `src/embed.py` | GPU: multilingual-e5-small embeddings of the raw names and addresses (reads any script). Blocking adds the embedding top-5 to the TF-IDF candidates, and features add name and address cosines. |
+| 4 | `src/train.py` | Stage 1, cross-fitted: LightGBM trained on half A and on half B. Each half gets honest out-of-fold probabilities; test gets the average of both models. |
+| 5 | `src/refine.py` | Stage 2: adds group context (the record's other candidates, the entity's other candidates, similarity to the entity's strongest other member) and retrains. Chooses between a global threshold and a per-entity expected-F0.5 rule on half B. Each S2/S3 record goes to at most one S1, because ground truth never links one record to two entities. Writes both TSVs. |
 
 Country is used only to group records for blocking. It is never a model feature, so unseen countries work.
 No external data, APIs or lookups are used.
@@ -63,7 +64,5 @@ No external data, APIs or lookups are used.
 
 ## Roadmap
 
-1. Embedding blocking on the GPU with multilingual-e5-small, merged with the TF-IDF candidates.
-2. Fine-tune the encoder contrastively on the training pairs.
-3. Cross-source features, for example an S2 record that strongly matches an S3 record already linked to the same S1.
-4. Per-entity decision that maximizes expected F0.5, instead of one global threshold.
+1. Fine-tune the encoder contrastively on the training pairs.
+2. Pseudo-labels on test France to adapt to the unseen country.

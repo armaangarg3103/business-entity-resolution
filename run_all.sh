@@ -9,6 +9,8 @@
 #   NUM_THREADS  CPU threads to use                   (default: the pod's CPU limit)
 #   USE_EMB      1 = add GPU multilingual embeddings  (default: 1; 0 = TF-IDF only baseline)
 #   SKIP_PREP    1 = reuse prepared records from an earlier run in WORK_DIR
+# To rerun only the modelling after a code change:
+#   python -u src/train.py --work-dir W && python -u src/refine.py --work-dir W --out-dir O
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -38,8 +40,8 @@ else
 fi
 stage "3/6 block";    python -u src/block.py    --work-dir "$WORK_DIR" --emb-k "$EMB_K"
 stage "4/6 features"; python -u src/features.py --work-dir "$WORK_DIR"
-stage "5/6 train";    python -u src/train.py    --work-dir "$WORK_DIR"
-stage "6/6 predict";  python -u src/predict.py  --work-dir "$WORK_DIR" --out-dir "$OUT_DIR"
+stage "5/6 train (stage 1, cross-fitted)"; python -u src/train.py --work-dir "$WORK_DIR"
+stage "6/6 refine (stage 2) + write submission"; python -u src/refine.py --work-dir "$WORK_DIR" --out-dir "$OUT_DIR"
 
 VALIDATOR="$DATA_DIR/../utils/validate_submission.py"
 if [ -f "$VALIDATOR" ] && [ "$SAMPLE" = "1.0" ]; then

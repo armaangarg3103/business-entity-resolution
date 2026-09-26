@@ -1,13 +1,11 @@
-"""Stage 4: train the LightGBM pair classifier on universe A, tune the decision on universe B.
+"""Stage 5: first-stage pair classifier, cross-fitted over the two train halves.
 
-Decision rule (see decide()):
-  1. each S2/S3 record is given only to its highest-probability S1 candidate
-     (ground truth never assigns one record to two S1 entities);
-  2. that link is kept only if its probability >= threshold.
-The threshold is chosen to maximise the challenge metric (macro F0.5 over all S1 entities,
-singletons included) on universe B, which the model never trained on.
+  model_A is trained on half A (early stopping on B); model_B on half B (early stopping on A).
+  Out-of-fold probabilities p1 are saved for A (from model_B) and B (from model_A), so the
+  second stage (refine.py) learns from honest, never-seen-in-training probabilities.
+  The test probability is the average of both models, so all training data is used.
 
-Output: <work>/model.txt, <work>/decision.json
+Output: <work>/model_A.txt, model_B.txt, stage1.json and <work>/<universe>/p1.npy
 """
 import argparse
 import json
@@ -28,74 +26,99 @@ def feature_cols(df):
 
 
 def decide(pairs, prob, threshold):
-    """Return the kept (q, s1) rows: best S1 per q, above threshold."""
+    """Threshold rule: best S1 per q, kept if its probability >= threshold."""
     d = pd.DataFrame({"q": pairs.q.to_numpy(), "s1": pairs.s1.to_numpy(), "p": prob})
     best = d.sort_values("p", ascending=False, kind="stable").drop_duplicates("q")
     return best[best.p >= threshold]
 
 
-def evaluate(work, universe, feats, prob, thresholds):
-    """Macro F0.5 on a train universe for each threshold; also per country at the best one."""
+def load_eval(work, universe):
     recs = pd.read_parquet(os.path.join(work, universe, "records.parquet"), columns=["entity_id", "src", "country"])
     ids = recs.entity_id.to_numpy()
     truth = pd.read_parquet(os.path.join(work, universe, "truth.parquet"))
     s1_all = ids[recs.src.to_numpy() == 1]
-    res = {}
-    for t in thresholds:
-        kept = decide(feats, prob, t)
-        pred = pd.DataFrame({"s1": ids[kept.s1.to_numpy()], "q": ids[kept.q.to_numpy()]})
-        res[t] = macro_f05_vec(s1_all, truth, pred)
-    best_t = max(res, key=res.get)
-    kept = decide(feats, prob, best_t)
-    pred = pd.DataFrame({"s1": ids[kept.s1.to_numpy()], "q": ids[kept.q.to_numpy()]})
     country = pd.Series(recs.country.to_numpy(), index=ids)
-    by_c = {}
+    return ids, truth, s1_all, country
+
+
+def score_kept(ev, kept):
+    ids, truth, s1_all, _ = ev
+    pred = pd.DataFrame({"s1": ids[kept.s1.to_numpy()], "q": ids[kept.q.to_numpy()]})
+    return macro_f05_vec(s1_all, truth, pred)
+
+
+def score_by_country(ev, kept):
+    ids, truth, s1_all, country = ev
+    pred = pd.DataFrame({"s1": ids[kept.s1.to_numpy()], "q": ids[kept.q.to_numpy()]})
+    out = {}
     for c in country.unique():
         s1_c = s1_all[country.loc[s1_all].to_numpy() == c]
         keep = set(s1_c)
-        by_c[c] = macro_f05_vec(s1_c, truth[truth.s1.isin(keep)], pred[pred.s1.isin(keep)])
-    return res, best_t, by_c
+        out[c] = round(macro_f05_vec(s1_c, truth[truth.s1.isin(keep)], pred[pred.s1.isin(keep)]), 4)
+    return out
+
+
+def threshold_sweep(ev, pairs, prob, grid=None):
+    grid = grid or [round(x, 2) for x in np.arange(0.05, 0.96, 0.05)]
+    res = {t: score_kept(ev, decide(pairs, prob, t)) for t in grid}
+    best = max(res, key=res.get)
+    return best, res
+
+
+def fit(train, valid, cols, args, name):
+    params = dict(objective="binary", learning_rate=args.lr, num_leaves=args.leaves, min_data_in_leaf=100,
+                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
+                  num_threads=args.threads, force_col_wise=True, verbose=-1, seed=42)
+    print(f"[{name}] training on {len(train):,} rows with {args.threads} threads (progress every 50 rounds)", flush=True)
+    t0 = time.time()
+    dt = lgb.Dataset(train[cols], train.label)
+    dv = lgb.Dataset(valid[cols], valid.label, reference=dt)
+    m = lgb.train(params, dt, args.rounds, valid_sets=[dv], valid_names=["valid"],
+                  callbacks=[lgb.early_stopping(100), lgb.log_evaluation(50)])
+    print(f"[{name}] done in {time.time() - t0:.0f}s, best iteration {m.best_iteration}", flush=True)
+    return m
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work-dir", required=True)
     ap.add_argument("--rounds", type=int, default=3000)
-    ap.add_argument("--lr", type=float, default=0.05)
+    ap.add_argument("--lr", type=float, default=0.08)
     ap.add_argument("--leaves", type=int, default=255)
     ap.add_argument("--threads", type=int, default=N_THREADS)
     args = ap.parse_args()
     w = args.work_dir
+    pred_kw = dict(num_threads=args.threads)
 
-    t0 = time.time()
     A = pd.read_parquet(os.path.join(w, "trainA", "features.parquet"))
     B = pd.read_parquet(os.path.join(w, "trainB", "features.parquet"))
     cols = feature_cols(A)
-    print(f"train rows {len(A):,} | valid rows {len(B):,} | {len(cols)} features")
+    print(f"A rows {len(A):,} | B rows {len(B):,} | {len(cols)} features")
 
-    params = dict(objective="binary", learning_rate=args.lr, num_leaves=args.leaves, min_data_in_leaf=100,
-                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
-                  num_threads=args.threads, force_col_wise=True, verbose=-1, seed=42)
-    print(f"training LightGBM with {args.threads} threads (progress every 25 rounds)", flush=True)
-    dA = lgb.Dataset(A[cols], A.label, free_raw_data=True)
-    dB = lgb.Dataset(B[cols], B.label, reference=dA)
-    model = lgb.train(params, dA, args.rounds, valid_sets=[dB], valid_names=["B"],
-                      callbacks=[lgb.early_stopping(100), lgb.log_evaluation(25)])
-    model.save_model(os.path.join(w, "model.txt"))
-    print(f"trained in {time.time() - t0:.0f}s, best iteration {model.best_iteration}")
+    mA = fit(A, B, cols, args, "model_A")
+    mA.save_model(os.path.join(w, "model_A.txt"))
+    mB = fit(B, A, cols, args, "model_B")
+    mB.save_model(os.path.join(w, "model_B.txt"))
 
-    prob = model.predict(B[cols], num_iteration=model.best_iteration, num_threads=args.threads)
-    grid = [round(x, 2) for x in np.arange(0.05, 0.96, 0.05)]
-    res, best_t, by_c = evaluate(w, "trainB", B, prob, grid)
-    for t in grid:
-        print(f"  threshold {t:.2f}  macro F0.5 {res[t]:.4f}" + ("   <- best" if t == best_t else ""))
-    print("  per country at best threshold:", {k: round(v, 4) for k, v in by_c.items()})
-
-    imp = pd.Series(model.feature_importance("gain"), index=cols).sort_values(ascending=False)
+    summary = {"features": cols}
+    for u, df, m in [("trainA", A, mB), ("trainB", B, mA)]:
+        p = m.predict(df[cols], num_iteration=m.best_iteration, **pred_kw).astype(np.float32)
+        np.save(os.path.join(w, u, "p1.npy"), p)
+        ev = load_eval(w, u)
+        t, res = threshold_sweep(ev, df, p)
+        summary[u] = {"threshold": t, "f05": res[t], "by_country": score_by_country(ev, decide(df, p, t))}
+        print(f"[stage 1] {u} out-of-fold: best threshold {t} -> macro F0.5 {res[t]:.4f} {summary[u]['by_country']}")
+    imp = pd.Series(mA.feature_importance("gain"), index=cols).sort_values(ascending=False)
     print("top features:", (imp / imp.sum()).round(3).head(15).to_dict())
-    with open(os.path.join(w, "decision.json"), "w") as f:
-        json.dump({"threshold": best_t, "valid_f05": res[best_t], "valid_f05_by_country": by_c,
-                   "best_iteration": model.best_iteration, "features": cols}, f, indent=2)
+    del A, B
+
+    T = pd.read_parquet(os.path.join(w, "test", "features.parquet"), columns=cols)
+    p = 0.5 * (mA.predict(T, num_iteration=mA.best_iteration, **pred_kw)
+               + mB.predict(T, num_iteration=mB.best_iteration, **pred_kw))
+    np.save(os.path.join(w, "test", "p1.npy"), p.astype(np.float32))
+    print(f"[stage 1] test probabilities written ({len(p):,} pairs)")
+    with open(os.path.join(w, "stage1.json"), "w") as f:
+        json.dump(summary, f, indent=2)
 
 
 if __name__ == "__main__":
