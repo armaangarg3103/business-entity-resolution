@@ -8,6 +8,7 @@ rapidfuzz>=3.6
 anyascii>=0.3
 sparse_dot_topn>=1.1,<2
 lightgbm>=4.0,<5
+xgboost>=2.0,<4
 tqdm
 # used by the embedding-blocking stage (next iteration)
 transformers>=4.44,<4.50

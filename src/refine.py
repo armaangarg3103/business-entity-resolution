@@ -20,13 +20,13 @@ import json
 import os
 import time
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
 from rapidfuzz.process import cpdist
 
 from common import N_THREADS, ensure_dir, write_id_lists
+from gbm import train_gbm
 from features import margin_over_others
 from train import decide, load_eval, score_by_country, score_kept, threshold_sweep
 
@@ -131,7 +131,6 @@ def main():
     ap.add_argument("--rounds", type=int, default=2000)
     ap.add_argument("--lr", type=float, default=0.05)
     ap.add_argument("--leaves", type=int, default=127)
-    ap.add_argument("--threads", type=int, default=N_THREADS)
     args = ap.parse_args()
     w = args.work_dir
     cols1 = json.load(open(os.path.join(w, "stage1.json")))["features"]
@@ -148,16 +147,11 @@ def main():
     KA, XA, _ = build("trainA")
     KB, XB, pB1 = build("trainB")
     cols2 = list(XA.columns)
-    params = dict(objective="binary", learning_rate=args.lr, num_leaves=args.leaves, min_data_in_leaf=200,
-                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
-                  num_threads=args.threads, force_col_wise=True, verbose=-1, seed=7)
-    dA = lgb.Dataset(XA, KA.label)
-    dB = lgb.Dataset(XB, KB.label, reference=dA)
-    m = lgb.train(params, dA, args.rounds, valid_sets=[dB], valid_names=["B"],
-                  callbacks=[lgb.early_stopping(100), lgb.log_evaluation(50)])
-    m.save_model(os.path.join(w, "model_stage2.txt"))
-    pB = m.predict(XB, num_iteration=m.best_iteration, num_threads=args.threads)
-    del XA, dA, dB
+    m = train_gbm(XA, KA.label, XB, KB.label, leaves=args.leaves, lr=args.lr, rounds=args.rounds, seed=7,
+                  name="stage2")
+    m.save(os.path.join(w, "model_stage2"))
+    pB = m.predict(XB)
+    del XA
 
     ev = load_eval(w, "trainB")
     t1, r1 = threshold_sweep(ev, KB, pB1)
@@ -175,12 +169,11 @@ def main():
     keptB = apply(KB, pB)
     print(f"[B] chosen rule {rule}: macro F0.5 {cands[rule]:.4f} by country {score_by_country(ev, keptB)}")
     error_report(ev, keptB)
-    imp = pd.Series(m.feature_importance("gain"), index=cols2).sort_values(ascending=False)
-    print("stage-2 top features:", (imp / imp.sum()).round(3).head(12).to_dict())
+    print("stage-2 top features:", m.importance(cols2).round(3).head(12).to_dict())
     del XB
 
     KT, XT, _ = build("test")
-    pT = m.predict(XT[cols2], num_iteration=m.best_iteration, num_threads=args.threads)
+    pT = m.predict(XT[cols2])
     pd.DataFrame({"q": KT.q.to_numpy(), "s1": KT.s1.to_numpy(), "p": pT.astype(np.float32)})         .to_parquet(os.path.join(w, "test", "p2.parquet"), index=False)   # for variant.py
     kept = apply(KT, pT)
     recs = pd.read_parquet(os.path.join(w, "test", "records.parquet"), columns=["entity_id", "src", "country"])

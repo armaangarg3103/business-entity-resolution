@@ -12,11 +12,11 @@ import json
 import os
 import time
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from common import N_THREADS, macro_f05_vec
+from common import macro_f05_vec
+from gbm import train_gbm
 
 NOT_FEATURES = {"q", "s1", "label"}
 
@@ -66,17 +66,9 @@ def threshold_sweep(ev, pairs, prob, grid=None):
 
 
 def fit(train, valid, cols, args, name):
-    params = dict(objective="binary", learning_rate=args.lr, num_leaves=args.leaves, min_data_in_leaf=100,
-                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
-                  num_threads=args.threads, force_col_wise=True, verbose=-1, seed=42)
-    print(f"[{name}] training on {len(train):,} rows with {args.threads} threads (progress every 50 rounds)", flush=True)
-    t0 = time.time()
-    dt = lgb.Dataset(train[cols], train.label)
-    dv = lgb.Dataset(valid[cols], valid.label, reference=dt)
-    m = lgb.train(params, dt, args.rounds, valid_sets=[dv], valid_names=["valid"],
-                  callbacks=[lgb.early_stopping(100), lgb.log_evaluation(50)])
-    print(f"[{name}] done in {time.time() - t0:.0f}s, best iteration {m.best_iteration}", flush=True)
-    return m
+    print(f"[{name}] training on {len(train):,} rows (progress every 50 rounds)", flush=True)
+    return train_gbm(train[cols], train.label, valid[cols], valid.label,
+                     leaves=args.leaves, lr=args.lr, rounds=args.rounds, seed=42, name=name)
 
 
 def main():
@@ -85,10 +77,8 @@ def main():
     ap.add_argument("--rounds", type=int, default=3000)
     ap.add_argument("--lr", type=float, default=0.08)
     ap.add_argument("--leaves", type=int, default=255)
-    ap.add_argument("--threads", type=int, default=N_THREADS)
     args = ap.parse_args()
     w = args.work_dir
-    pred_kw = dict(num_threads=args.threads)
 
     A = pd.read_parquet(os.path.join(w, "trainA", "features.parquet"))
     B = pd.read_parquet(os.path.join(w, "trainB", "features.parquet"))
@@ -96,25 +86,23 @@ def main():
     print(f"A rows {len(A):,} | B rows {len(B):,} | {len(cols)} features")
 
     mA = fit(A, B, cols, args, "model_A")
-    mA.save_model(os.path.join(w, "model_A.txt"))
+    mA.save(os.path.join(w, "model_A"))
     mB = fit(B, A, cols, args, "model_B")
-    mB.save_model(os.path.join(w, "model_B.txt"))
+    mB.save(os.path.join(w, "model_B"))
 
     summary = {"features": cols}
     for u, df, m in [("trainA", A, mB), ("trainB", B, mA)]:
-        p = m.predict(df[cols], num_iteration=m.best_iteration, **pred_kw).astype(np.float32)
+        p = m.predict(df[cols])
         np.save(os.path.join(w, u, "p1.npy"), p)
         ev = load_eval(w, u)
         t, res = threshold_sweep(ev, df, p)
         summary[u] = {"threshold": t, "f05": res[t], "by_country": score_by_country(ev, decide(df, p, t))}
         print(f"[stage 1] {u} out-of-fold: best threshold {t} -> macro F0.5 {res[t]:.4f} {summary[u]['by_country']}")
-    imp = pd.Series(mA.feature_importance("gain"), index=cols).sort_values(ascending=False)
-    print("top features:", (imp / imp.sum()).round(3).head(15).to_dict())
+    print("top features:", mA.importance(cols).round(3).head(15).to_dict())
     del A, B
 
     T = pd.read_parquet(os.path.join(w, "test", "features.parquet"), columns=cols)
-    p = 0.5 * (mA.predict(T, num_iteration=mA.best_iteration, **pred_kw)
-               + mB.predict(T, num_iteration=mB.best_iteration, **pred_kw))
+    p = 0.5 * (mA.predict(T) + mB.predict(T))
     np.save(os.path.join(w, "test", "p1.npy"), p.astype(np.float32))
     print(f"[stage 1] test probabilities written ({len(p):,} pairs)")
     with open(os.path.join(w, "stage1.json"), "w") as f:
