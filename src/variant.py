@@ -7,6 +7,7 @@ differ only in that country's rows isolate its effect on the score.
   python src/variant.py --work-dir W --out-dir O                                  # same as refine
   python src/variant.py --work-dir W --out-dir O --override France=threshold:0.9  # stricter France
   python src/variant.py --work-dir W --out-dir O --override France=expected:2.0
+  python src/variant.py --work-dir W --out-dir O --stage1 --rule threshold:0.75   # stage 1 only
 
 Rules: threshold:<t> keeps a record's best S1 if p >= t;
        expected:<alpha> keeps the per-entity set maximising expected F0.5 of p**alpha
@@ -16,6 +17,7 @@ import argparse
 import json
 import os
 
+import numpy as np
 import pandas as pd
 
 from common import ensure_dir, write_id_lists
@@ -32,11 +34,21 @@ def main():
     ap.add_argument("--work-dir", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--override", action="append", default=[], help="COUNTRY=rule:value, repeatable")
+    ap.add_argument("--stage1", action="store_true", help="use stage-1 test probabilities (p1.npy)")
+    ap.add_argument("--rule", default=None, help="default rule for all countries, e.g. threshold:0.75")
     args = ap.parse_args()
     w = args.work_dir
 
-    default = json.load(open(os.path.join(w, "stage2.json")))["rule"]
-    P = pd.read_parquet(os.path.join(w, "test", "p2.parquet"))
+    if args.stage1:
+        P = pd.read_parquet(os.path.join(w, "test", "features.parquet"), columns=["q", "s1"])
+        P["p"] = np.load(os.path.join(w, "test", "p1.npy"))
+    else:
+        P = pd.read_parquet(os.path.join(w, "test", "p2.parquet"))
+    if args.rule:
+        r, v = args.rule.split(":")
+        default = (r, float(v))
+    else:
+        default = json.load(open(os.path.join(w, "stage2.json")))["rule"]
     recs = pd.read_parquet(os.path.join(w, "test", "records.parquet"), columns=["entity_id", "src", "country"])
     ids, country = recs.entity_id.to_numpy(), recs.country.to_numpy()
     s1_ids = ids[recs.src.to_numpy() == 1]

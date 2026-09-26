@@ -121,7 +121,8 @@ def score_by_country(ev, kept):
 
 def threshold_sweep(ev, pairs, prob, grid=None):
     grid = grid or [round(float(x), 2) for x in np.arange(0.05, 0.96, 0.05)]
-    res = {t: score_kept(ev, decide(pairs, prob, t)) for t in grid}
+    best_per_q = decide(pairs, prob, -1.0)          # sort once, then only filter per threshold
+    res = {t: score_kept(ev, best_per_q[best_per_q.p >= t]) for t in grid}
     best = max(res, key=res.get)
     return best, res
 
