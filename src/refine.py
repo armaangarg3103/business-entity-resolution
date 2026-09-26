@@ -181,6 +181,7 @@ def main():
 
     KT, XT, _ = build("test")
     pT = m.predict(XT[cols2], num_iteration=m.best_iteration, num_threads=args.threads)
+    pd.DataFrame({"q": KT.q.to_numpy(), "s1": KT.s1.to_numpy(), "p": pT.astype(np.float32)})         .to_parquet(os.path.join(w, "test", "p2.parquet"), index=False)   # for variant.py
     kept = apply(KT, pT)
     recs = pd.read_parquet(os.path.join(w, "test", "records.parquet"), columns=["entity_id", "src", "country"])
     ids = recs.entity_id.to_numpy()
