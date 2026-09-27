@@ -145,11 +145,19 @@ def main():
     cols1 = json.load(open(os.path.join(w, "stage1.json")))["features"]
     path = {u: os.path.join(w, u, "features.parquet") for u in ("trainA", "trainB", "test")}
 
+    use_ce = all(os.path.exists(os.path.join(w, u, "ce.npy")) for u in path)
+    print(f"cross-encoder scores: {'used' if use_ce else 'not available'}")
+
     def graph(u):
         t0 = time.time()
         K = read_cols(path[u], ["q", "s1", "q_src"])
         p = np.load(os.path.join(w, u, "p1.npy"))
         G = graph_features(w, u, K, p)
+        if use_ce:  # NaN = not scored (stage 1 was already sure); ce_f falls back to p1 there
+            ce = np.load(os.path.join(w, u, "ce.npy"))
+            G["ce"] = ce
+            G["ce_f"] = np.where(np.isnan(ce), p, ce).astype(F32)
+            G["ce_f_margin"] = margin_over_others(K.q.to_numpy(), G.ce_f.to_numpy())
         print(f"[{u}] {G.shape[1]} group features for {len(G):,} pairs in {time.time() - t0:.0f}s", flush=True)
         return K, G, p
 
