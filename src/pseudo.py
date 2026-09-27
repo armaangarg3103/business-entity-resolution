@@ -31,6 +31,7 @@ def main():
     ap.add_argument("--easy-rate", type=float, default=0.05)
     ap.add_argument("--probs", choices=["p1", "p2"], default="p1",
                     help="p2 = final stage-2 test probabilities (stronger teacher, from refine.py)")
+    ap.add_argument("--out", default="pseudo.parquet")
     args = ap.parse_args()
     w = args.work_dir
     path = os.path.join(w, "test", "features.parquet")
@@ -64,11 +65,13 @@ def main():
         m = keep[off:off + n]
         part = b[m].reset_index(drop=True)
         part["label"] = label[off:off + n][m]
+        part["q"] = K.q.to_numpy()[off:off + n][m]
+        part["s1"] = K.s1.to_numpy()[off:off + n][m]
         parts.append(part)
         off += n
     out = pd.concat(parts, ignore_index=True)
-    out.to_parquet(os.path.join(w, "pseudo.parquet"), index=False)
-    print(f"written {len(out):,} rows to {os.path.join(w, 'pseudo.parquet')}")
+    out.to_parquet(os.path.join(w, args.out), index=False)
+    print(f"written {len(out):,} rows to {os.path.join(w, args.out)}")
 
 
 if __name__ == "__main__":
