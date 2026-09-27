@@ -29,13 +29,21 @@ def main():
     ap.add_argument("--margin", type=float, default=0.8)
     ap.add_argument("--neg", type=float, default=0.02)
     ap.add_argument("--easy-rate", type=float, default=0.05)
+    ap.add_argument("--probs", choices=["p1", "p2"], default="p1",
+                    help="p2 = final stage-2 test probabilities (stronger teacher, from refine.py)")
     args = ap.parse_args()
     w = args.work_dir
     path = os.path.join(w, "test", "features.parquet")
     cols = feature_names(os.path.join(w, "trainA", "features.parquet"))
 
     K = read_cols(path, ["q", "s1"])
-    p = np.load(os.path.join(w, "test", "p1.npy"))
+    if args.probs == "p2":
+        P2 = pd.read_parquet(os.path.join(w, "test", "p2.parquet"))
+        assert len(P2) == len(K) and (P2.q.to_numpy() == K.q.to_numpy()).all(), "p2 rows not aligned"
+        p = P2.p.to_numpy()
+    else:
+        p = np.load(os.path.join(w, "test", "p1.npy"))
+    print(f"teacher probabilities: {args.probs}")
     country = pd.read_parquet(os.path.join(w, "test", "records.parquet"), columns=["country"]).country.to_numpy()
     in_c = np.isin(country[K.s1.to_numpy()], args.countries.split(","))
     margin = margin_over_others(K.q.to_numpy(), p)
