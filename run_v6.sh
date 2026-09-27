@@ -16,7 +16,7 @@ stage "1/4 French pseudo-pairs from round-2 stage 2"
 python -u src/pseudo.py --work-dir "$WORK_DIR" --probs p2 --out pseudo_ce.parquet
 stage "2/4 cross-encoder $BACKBONE"
 python -u src/ce.py --work-dir "$WORK_DIR" --backbone "$BACKBONE" --lo 0.003 --hi 0.997 \
-       --max-train ${MAX_TRAIN:-1500000} --batch 128 --lr 3e-5 --pseudo-file pseudo_ce.parquet
+       --max-train ${MAX_TRAIN:-4000000} --epochs ${EPOCHS:-2} --batch 128 --lr 3e-5 --pseudo-file pseudo_ce.parquet
 stage "3/4 stage 2"; python -u src/refine.py --work-dir "$WORK_DIR" --out-dir "$OUT_DIR"
 stage "4/4 France cutoff $FRANCE"
 python -u src/variant.py --work-dir "$WORK_DIR" --out-dir "${OUT_DIR}_fr" --override "France=threshold:$FRANCE" --matching-only
