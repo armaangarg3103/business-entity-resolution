@@ -1,7 +1,7 @@
 # ML Challenge 2026: Business Entity Resolution Solution
 
-**Team Name:** [Team name]
-**Team Members:** Armaan Garg, [other members]
+**Team Name:** MALAI
+**Team Members:** Armaan Garg (team leader), Kriti Gupta, Abhikansh Mittal
 **Submission Date:** 29 September 2026
 
 ---
