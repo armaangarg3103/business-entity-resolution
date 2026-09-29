@@ -1,16 +1,16 @@
-# Python 3.10. PyTorch 2.4 (NVIDIA NGC build) is provided by the container.
-numpy<2
-pandas>=2.0,<3
-pyarrow>=14
-scikit-learn>=1.3,<1.7
-scipy>=1.10
-rapidfuzz>=3.6
-anyascii>=0.3
-sparse_dot_topn>=1.1,<2
-lightgbm>=4.0,<5
-xgboost>=2.0,<4
-tqdm
-# used by the embedding-blocking stage (next iteration)
-transformers>=4.44,<4.50
-sentence-transformers>=3.4,<5
-huggingface-hub<1.0
+# Python 3.10 on the NVIDIA NGC PyTorch container (torch 2.4.0a0+f70bd71a48.nv24.6, CUDA 12.5 driver).
+# Versions below are the ones installed on the machine that produced the final submission.
+numpy==1.24.4
+pandas==2.2.1
+pyarrow==14.0.2
+scikit-learn==1.5.0
+scipy==1.13.1
+rapidfuzz==3.14.5
+anyascii==0.3.3
+sparse_dot_topn==1.2.0
+lightgbm==4.7.0
+xgboost>=2.0,<4          # GPU hist training; run `pip freeze | grep xgboost` to pin the exact build
+tqdm==4.66.4
+transformers==4.49.0
+sentence-transformers==4.1.0
+huggingface-hub==0.36.2

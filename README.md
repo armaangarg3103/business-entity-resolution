@@ -1,68 +1,56 @@
 # Business Entity Resolution (Amazon ML Challenge 2026)
 
-Finds, for every Source 1 business, all matching Source 2 / Source 3 records.
-The pipeline runs in five stages: normalize, block, featurize, LightGBM, then decide.
-It is tuned for the challenge metric, which is macro F0.5 per Source 1 entity.
+For every Source 1 business, the pipeline finds all matching Source 2 and Source 3 records. The final submission scored **0.983078** on the public leaderboard, with a validation macro F0.5 of **0.9915**. The full method is in `docs/Documentation_template.md`.
 
-## Quick start (GPU server)
+## Reproduce the final submission
 
 ```bash
-# 1. get the code
-cd /workspace/er/code
-git clone https://github.com/armaangarg3103/business-entity-resolution.git business_entity_resolution
-cd business_entity_resolution
-
-# 2. install dependencies (re-run after a pod restart)
+# 1. dataset: unzip the challenge data anywhere under /workspace/er/data (or set DATA_DIR)
+# 2. dependencies (NVIDIA NGC PyTorch container, Python 3.10)
 bash setup.sh
-
-# 3. smoke test on 2% of the data (a few minutes)
-SAMPLE=0.02 WORK_DIR=/workspace/er/work_small OUT_DIR=/workspace/er/output_small bash run_all.sh
-
-# 4. full run in the background, so closing the browser does not kill it
-nohup bash run_all.sh > /workspace/er/run.log 2>&1 &
-tail -f /workspace/er/run.log
+# 3. everything, in the order used for the final submission (several hours on one H100 slice)
+nohup bash reproduce.sh > /workspace/er/reproduce.log 2>&1 &
 ```
 
-The dataset folder, the one holding `train/` and `test/`, is found automatically under `/workspace/er/data`.
-Set `DATA_DIR` to point elsewhere.
-The thread count is detected from the pod's CPU limit. Set `NUM_THREADS` to override it.
+The last step writes `/workspace/er/output/matching_results.tsv` and `/workspace/er/output/candidate_pairs.tsv`, then runs the official validator on them. GPU training is not bit-for-bit deterministic, so a rerun gives very close but not identical files.
 
-To get new code later, run `git pull` inside the repo folder.
+`reproduce.sh` chains these scripts:
 
-## Outputs
+| Step | Script | What it produces |
+|---|---|---|
+| A | `run_all.sh` | Prepared records, embeddings, candidates, features, and the version-2 models |
+| B | `src/ce.py` with its default settings | Small cross-encoder scores, used by version 3 |
+| C | `run_v3.sh` | Rarity features, French pseudo-labels, stage 1, stage 2 (version 3) |
+| D | `run_final.sh` | Stronger pseudo-labels, large cross-encoder, stage 2 (final model) |
+| E | `src/variant.py` with France at 0.99 | The submitted files |
 
-| File | Meaning |
+To package the submission zip after a run, use `TEAM=<team_name> bash make_zip.sh`.
+
+## Pipeline
+
+| Script | Role |
 |---|---|
-| `output/matching_results.tsv` | final matches; this is what you upload to the leaderboard |
-| `output/candidate_pairs.tsv` | every pair the model scored, a superset of the matches |
-| `work/stage1.json`, `work/stage2.json` | validation F0.5 per stage and country, chosen decision rule |
-| `work/model_A.txt`, `model_B.txt`, `model_stage2.txt` | trained models |
+| `src/prepare.py` | Loads the TSVs, splits train into halves A and B by Source 1 entity, each about the size of test. Normalizes text: script folding, abbreviations, numbers, aliases. Discovers generic name words per country. |
+| `src/embed.py` | multilingual-e5-small embeddings of raw names and addresses, on the GPU |
+| `src/block.py` | Per country: TF-IDF top 8 plus embedding top 5 Source 1 candidates for each Source 2/3 record |
+| `src/features.py` | Fuzzy name and address scores, number overlap, embedding cosines, blocking score and rank, margin over competing candidates |
+| `src/extra.py` | Country-relative rarity features: IDF-weighted cosines fitted per country, and same-name ambiguity counts |
+| `src/pseudo.py` | French pseudo-labels from confident test predictions, since France has no training labels |
+| `src/train.py` | Stage 1: XGBoost, cross-fitted over A and B, with negative sampling and optional pseudo-labels |
+| `src/ce.py` | Cross-encoder: multilingual-e5 fine-tuned on text pairs, cross-fitted, scoring only uncertain pairs |
+| `src/refine.py` | Stage 2 with group features. Picks the decision rule on B: expected-F0.5 per entity, or a global threshold. Writes both TSVs. |
+| `src/variant.py` | Rebuilds the submission with a different decision rule for chosen countries |
+| `src/diagnose.py` | Error analysis on a train half |
+| `src/gbm.py`, `src/common.py` | XGBoost on GPU with LightGBM fallback; normalization, metric and output helpers |
 
-After a full run, `run_all.sh` runs the official validator automatically.
+Country is used only to group records for blocking and for the France cutoff. It is never a model input. No external data, APIs or lookups are used. All models are MIT or Apache-2.0 licensed and at most 560M parameters.
 
-## How it works
+## Settings
 
-| Stage | Script | What it does |
+| Environment variable | Default | Meaning |
 |---|---|---|
-| 1 | `src/prepare.py` | Splits train by S1 entity into two halves, A and B, each about the size of the test set. Normalizes text: ascii-folds any script, lowercases, canonicalizes abbreviations, extracts address numbers, and splits DBA / "formerly" aliases. Generic name words such as inc, pvt or sarl are **discovered per country from word frequency**, not hand-listed, so France works without French training data. |
-| 2 | `src/block.py` | Each S2/S3 record keeps its top-K most similar S1 records of the same country. The search uses sparse TF-IDF over name words, name character trigrams, address words and numbers. Reports blocking recall on the train halves. |
-| 3 | `src/features.py` | About 40 country-independent features: fuzzy name and address scores, number overlap, the blocking score and rank, and the **margin over the best competing candidate** of the same record. |
-| 2b | `src/embed.py` | GPU: multilingual-e5-small embeddings of the raw names and addresses (reads any script). Blocking adds the embedding top-5 to the TF-IDF candidates, and features add name and address cosines. |
-| 4 | `src/train.py` | Stage 1, cross-fitted: LightGBM trained on half A and on half B. Each half gets honest out-of-fold probabilities; test gets the average of both models. |
-| 5 | `src/refine.py` | Stage 2: adds group context (the record's other candidates, the entity's other candidates, similarity to the entity's strongest other member) and retrains. Chooses between a global threshold and a per-entity expected-F0.5 rule on half B. Each S2/S3 record goes to at most one S1, because ground truth never links one record to two entities. Writes both TSVs. |
-
-Country is used only to group records for blocking. It is never a model feature, so unseen countries work.
-No external data, APIs or lookups are used.
-
-## Tuning knobs
-
-| Setting | Where | Effect |
-|---|---|---|
-| `--top-k` (default 8) | `block.py` | more candidates means higher recall ceiling, but more pairs to score |
-| `--max-df` (default 0.01) | `block.py` | drops very common tokens; lower is faster, higher gives more recall |
-| `--threshold` | `predict.py` | overrides the tuned threshold; higher means more precision |
-
-## Roadmap
-
-1. Fine-tune the encoder contrastively on the training pairs.
-2. Pseudo-labels on test France to adapt to the unseen country.
+| `DATA_DIR` | found under `/workspace/er/data` | folder containing `train/` and `test/` |
+| `WORK_DIR` | `/workspace/er/work` | intermediate files |
+| `NUM_THREADS` | the pod's CPU limit | CPU threads |
+| `GBM_BACKEND` | `auto` (XGBoost if a GPU is visible) | `xgb` or `lgb` |
+| `BACKBONE` | `intfloat/multilingual-e5-large` in `run_final.sh` | cross-encoder model |
