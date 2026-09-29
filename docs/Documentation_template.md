@@ -197,6 +197,8 @@ The main lesson is that the distribution shift to an unseen country is about fea
 
 **Entry point:** `bash reproduce.sh` runs every step and writes `output/matching_results.tsv` and `output/candidate_pairs.tsv`. The official validator reports PASS on both files.
 
+**Candidate file in this archive:** the final `candidate_pairs.tsv` (117,260,966 pairs) was produced on a GPU server whose access ended before it could be downloaded, so it is not in the zip. `output/CANDIDATE_PAIRS_NOTE.md` gives its details, and `reproduce.sh` regenerates it.
+
 **Hardware used:** one NVIDIA H100 MIG slice (3g.40gb), 15 CPU threads and 90 GB of RAM. The heaviest step is the large cross-encoder, about 4 hours for both folds including scoring.
 
 ### B. Additional Results
